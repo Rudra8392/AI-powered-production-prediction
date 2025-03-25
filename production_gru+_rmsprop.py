@@ -2,9 +2,12 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import TimeSeriesSplit
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import GRU, Dense, Dropout, BatchNormalization
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
 import tensorflow as tf
 import os
 import pickle
@@ -22,12 +25,31 @@ df.set_index('Datetime', inplace=True)
 features = ['WHTP', 'DSP', 'THP', 'Pressure DS Choke', 'Temperature DS Choke', 'CHP', 'TAP', 'BCP']
 targets = ['OIL (BOPD)', 'GAS (MCF)', 'WATER (BWPD)']
 
-# Scale data
-scaler = MinMaxScaler()
-df[features + targets] = scaler.fit_transform(df[features + targets])
+# Scale features before PCA
+feature_scaler = MinMaxScaler()
+features_scaled = feature_scaler.fit_transform(df[features])
 
-# Sequence length (increase to capture longer trends)
-seq_length = 48  # Use last 48 time steps instead of 24
+# Apply PCA
+pca = PCA(n_components=0.95)
+pca_result = pca.fit_transform(features_scaled)
+pca_columns = [f'PCA_{i+1}' for i in range(pca.n_components_)]
+pca_df = pd.DataFrame(pca_result, index=df.index, columns=pca_columns)
+
+# Scale targets
+target_scaler = MinMaxScaler()
+targets_scaled = target_scaler.fit_transform(df[targets])
+df_targets = pd.DataFrame(targets_scaled, index=df.index, columns=targets)
+
+# Combine PCA components with targets
+df_pca = pd.concat([pca_df, df_targets], axis=1)
+
+# Save PCA and scalers
+with open('pca_model.pkl', 'wb') as f:
+    pickle.dump(pca, f)
+with open('feature_scaler.pkl', 'wb') as f:
+    pickle.dump(feature_scaler, f)
+with open('target_scaler.pkl', 'wb') as f:
+    pickle.dump(target_scaler, f)
 
 # Function to create sequences
 def create_sequences(data, seq_length, X_cols, y_cols):
@@ -37,101 +59,82 @@ def create_sequences(data, seq_length, X_cols, y_cols):
         y.append(data.iloc[i+seq_length][y_cols].values)
     return np.array(X), np.array(y)
 
-# Split dataset (Train: 70%, Validation: 15%, Test: 15%)
-train_size = int(len(df) * 0.7)
-val_size = int(len(df) * 0.15)
+seq_length = 48  # Time steps
+X, y = create_sequences(df_pca, seq_length, pca_columns, targets)
 
-df_train = df.iloc[:train_size]
-df_val = df.iloc[train_size:train_size+val_size]
-df_test = df.iloc[train_size+val_size:]
+# OPTIMIZED: Reduced Time Series Cross-Validation folds
+ts_splits = 3  # Reduced from 5
+tscv = TimeSeriesSplit(n_splits=ts_splits)
 
-X_train, y_train = create_sequences(df_train, seq_length, features, targets)
-X_val, y_val = create_sequences(df_val, seq_length, features, targets)
-X_test, y_test = create_sequences(df_test, seq_length, features, targets)
+# OPTIMIZED: Single checkpoint path instead of per-fold
+checkpoint_path = "./best_model_gru_pca.h5"
 
-# Define improved GRU model
-model = Sequential([
-    GRU(128, return_sequences=True, input_shape=(seq_length, len(features)), dropout=0.2, recurrent_dropout=0.2),
-    BatchNormalization(),
+for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+    print(f"Fold {fold+1}/{ts_splits}")
+    X_train, X_val = X[train_idx], X[val_idx]
+    y_train, y_val = y[train_idx], y[val_idx]
 
-    GRU(64, return_sequences=True, dropout=0.2, recurrent_dropout=0.2),
-    BatchNormalization(),
+    # Define GRU model with bias regularization
+    model = Sequential([
+        GRU(128, return_sequences=True, input_shape=(seq_length, len(pca_columns)), dropout=0.2, recurrent_dropout=0.2),
+        BatchNormalization(),
+        GRU(64, return_sequences=True, dropout=0.2, recurrent_dropout=0.2),
+        BatchNormalization(),
+        GRU(32, dropout=0.2, recurrent_dropout=0.2),
+        Dense(16, activation='relu', kernel_regularizer=l2(0.01)),
+        Dense(len(targets), kernel_regularizer=l2(0.01))
+    ])
 
-    GRU(32, dropout=0.2, recurrent_dropout=0.2),
-    Dense(16, activation='relu'),
-    Dense(len(targets))
-])
+    optimizer = tf.keras.optimizers.RMSprop(learning_rate=0.001)
+    model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
 
-# Compile model with RMSprop optimizer
-optimizer = tf.keras.optimizers.RMSprop(learning_rate=0.001)
-model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
+    # OPTIMIZED: Callbacks with more aggressive stopping and LR reduction
+    early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)  # Reduced from 10
+    model_checkpoint = ModelCheckpoint(filepath=checkpoint_path, save_best_only=True, monitor='val_loss')
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-5)  # Reduced from 5
 
-# Callbacks
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-checkpoint_path = "./best_model_gru.h5"
-model_checkpoint = ModelCheckpoint(filepath=checkpoint_path, save_best_only=True, monitor='val_loss')
-reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+    # OPTIMIZED: Training configuration
+    batch_size = 64  # Increased from 32
+    verbose = 2  # Reduced verbosity
+    
+    # Train model
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=50,  # Reduced from 100
+        batch_size=batch_size,
+        callbacks=[early_stopping, model_checkpoint, reduce_lr],
+        verbose=verbose
+    )
 
-# Train model
-history = model.fit(
-    X_train, y_train,
-    validation_data=(X_val, y_val),
-    epochs=100,  # Increase epochs for better learning
-    batch_size=32,
-    callbacks=[early_stopping, model_checkpoint, reduce_lr],
-    verbose=1
-)
+    # Evaluate model
+    test_loss, test_mae = model.evaluate(X_val, y_val, verbose=1)
+    print(f"Fold {fold+1} - Test Loss: {test_loss}, Test MAE: {test_mae}")
 
-# Evaluate model
-test_loss, test_mae = model.evaluate(X_test, y_test, verbose=1)
-print(f"Test Loss: {test_loss}, Test MAE: {test_mae}")
-
-# Load best model weights
-model.load_weights(checkpoint_path)
-
-# --- Improved Future Predictions ---
-future_steps = 1080  # Assuming 2-hour intervals, 3 months = 1080 steps
-last_seq = df[features].values[-seq_length:].copy()
+# Predict next 3 months
+total_future_steps = 1080
+last_seq = df_pca[pca_columns].values[-seq_length:].copy()
 future_predictions = []
 
-for _ in range(future_steps):
-    pred = model.predict(last_seq[np.newaxis, :, :])[0]  # Predict next step
-
-    # Add randomness to prevent identical outputs
-    pred += np.random.normal(0, 0.01, size=pred.shape)  # Small random noise
-
-    # Create new row with past feature values + predicted target values
-    new_row = last_seq[-1].copy()
-    new_row[-len(targets):] = pred  # Replace last columns with new predictions
-
+for _ in range(total_future_steps):
+    pred = model.predict(last_seq[np.newaxis, :, :], verbose=0)[0]  # Reduced verbosity
     future_predictions.append(pred)
-    last_seq = np.roll(last_seq, -1, axis=0)  # Shift left
-    last_seq[-1] = new_row  # Update with new prediction
+    last_seq = np.roll(last_seq, -1, axis=0)
+    last_seq[-1] = np.append(pred, last_seq[-1][-1])  # Ensure shape consistency
 
-# Convert predictions back to original scale
-future_predictions = scaler.inverse_transform(np.concatenate([np.zeros((future_steps, len(features))), future_predictions], axis=1))[:, -len(targets):]
+future_predictions_array = np.array(future_predictions)
+future_predictions_original = target_scaler.inverse_transform(future_predictions_array)
+future_df = pd.DataFrame(future_predictions_original, columns=targets)
+future_df.to_csv("Future_3Months_Predictions_GRU_PCA.csv", index=False)
 
-# Save predictions
-future_df = pd.DataFrame(future_predictions, columns=targets)
-future_df.to_csv("Future_3Months_Predictions_GRU.csv", index=False)
-print("Predictions saved! Check 'Future_3Months_Predictions_GRU.csv' for results.")
-
-# --- Plot Training History ---
+# Plot training loss
 plt.figure(figsize=(10, 6))
 plt.plot(history.history['loss'], label='Train Loss')
 plt.plot(history.history['val_loss'], label='Validation Loss')
 plt.xlabel('Epochs')
 plt.ylabel('Loss')
 plt.legend()
-plt.title("GRU Training Loss")
-plt.savefig("training_loss_gru.png")
+plt.title("GRU with PCA Training Loss")
+plt.savefig("training_loss_gru_pca.png")
 
-# --- Plot Predictions ---
-for i, target in enumerate(targets):
-    plt.figure(figsize=(12, 6))
-    plt.plot(future_predictions[:, i], label='Predicted')
-    plt.title(f'Next 3 Months Forecast: {target}')
-    plt.legend()
-    plt.savefig(f"{target}_forecast_gru.png")
-
-print("Plots saved!")
+print("Cross-validation and future predictions completed! Predictions saved in Future_3Months_Predictions_GRU_PCA.csv")
